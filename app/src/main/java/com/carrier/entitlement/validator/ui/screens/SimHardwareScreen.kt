@@ -68,10 +68,15 @@ fun SimHardwareScreen(
                 Spacer(modifier = Modifier.height(10.dp))
 
                 InfoRow("Estado SIM", simInfo.simState)
+                InfoRow("Ranura / Slot", "Slot ${simInfo.slotIndex}")
                 InfoRow("Operador / SPN", simInfo.carrierName ?: "N/A")
                 InfoRow("MCC / MNC", "${simInfo.mcc ?: "---"} / ${simInfo.mnc ?: "---"}")
-                InfoRow("IMSI (Subscriber ID)", simInfo.subscriberId ?: "No disponible (sin permiso READ_PHONE_STATE)")
+                InfoRow("IMSI (Subscriber ID)", simInfo.subscriberId ?: "No leído aún (requiere Root o permiso privilegiado)")
                 InfoRow("Línea (MSISDN en SIM)", simInfo.phoneNumber ?: "No programado en SIM (EF_MSISDN)")
+                val diag = simInfo.diagnosisMsg
+                if (!diag.isNullOrBlank()) {
+                    InfoRow("Diagnóstico del Sistema", diag)
+                }
             }
         }
 
@@ -92,7 +97,7 @@ fun SimHardwareScreen(
 
                 Spacer(modifier = Modifier.height(14.dp))
 
-                if (simInfo.rootAvailable && !simInfo.hasModifyPhoneStatePermission) {
+                if (simInfo.rootAvailable) {
                     Button(
                         onClick = {
                             isGrantingRoot = true
@@ -109,7 +114,11 @@ fun SimHardwareScreen(
                     ) {
                         Icon(Icons.Default.AdminPanelSettings, contentDescription = null)
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("CONCEDER PERMISO USIM VÍA ROOT (SU)", fontWeight = FontWeight.Bold)
+                        Text(
+                            if (simInfo.subscriberId.isNullOrBlank()) "LEER IMSI Y CONCEDER PERMISOS (SU)"
+                            else "RE-CONCEDER PERMISOS VÍA ROOT (SU)",
+                            fontWeight = FontWeight.Bold
+                        )
                     }
                 }
             }

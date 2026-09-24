@@ -125,29 +125,27 @@ class Ts43Client(
             throw IllegalStateException("Ronda 2 Falló (HTTP ${response.code}, Diameter: $diameterCode): $raw")
         }
 
-        // Parsear XML de TemporaryToken
-        // <wap-provisioningdoc><characteristic type="TOKEN"><parm name="token" value="..."/><parm name="validity" value="..."/></characteristic>
-        // O buscar con regex en el cuerpo XML
+        // Parsear XML de TemporaryToken:
+        // <wap-provisioningdoc version="1.1"><characteristic type="APPLICATION"><parm name="AppID" value="ap2014"/><parm name="TemporaryToken" value="..."/><parm name="TemporaryTokenExpiry" value="..."/></characteristic></wap-provisioningdoc>
         var token = ""
         var exp = 0L
 
-        val tokenMatcher = Pattern.compile("name=[\"']token[\"']\\s+value=[\"']([^\"']+)[\"']").matcher(raw)
+        val tokenMatcher = Pattern.compile("name=[\"'](?:TemporaryToken|token)[\"']\\s+value=[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE).matcher(raw)
         if (tokenMatcher.find()) {
             token = tokenMatcher.group(1) ?: ""
         } else {
-            // Regex alternativa para tags <token>...</token>
-            val altMatcher = Pattern.compile("<token>([^<]+)</token>").matcher(raw)
+            val altMatcher = Pattern.compile("<(?:TemporaryToken|token)>([^<]+)</(?:TemporaryToken|token)>", Pattern.CASE_INSENSITIVE).matcher(raw)
             if (altMatcher.find()) token = altMatcher.group(1) ?: ""
         }
 
-        val expMatcher = Pattern.compile("name=[\"']validity[\"']\\s+value=[\"']([^\"']+)[\"']").matcher(raw)
+        val expMatcher = Pattern.compile("name=[\"'](?:TemporaryTokenExpiry|validity)[\"']\\s+value=[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE).matcher(raw)
         if (expMatcher.find()) {
-            exp = expMatcher.group(1)?.toLongOrNull() ?: 0L
+            val expStr = expMatcher.group(1) ?: ""
+            exp = expStr.toLongOrNull() ?: 0L
         }
 
-        if (token.isEmpty()) {
-            // Si el XML contiene el token en otro formato, conservamos el raw
-            token = raw
+        if (token.isBlank()) {
+            throw IllegalStateException("No se pudo extraer TemporaryToken del XML de respuesta: $raw")
         }
 
         TemporaryTokenResult(
@@ -197,12 +195,17 @@ class Ts43Client(
             throw IllegalStateException("VerifyPhoneNumber Falló (HTTP ${response.code}): $raw")
         }
 
-        // Buscar OperationResult en el XML devuelto por TS43Engine
+        // Buscar OperationResult en el XML devuelto por TS43Engine:
+        // <parm name="OperationResult" value="1"/> o <OperationResult>1</OperationResult>
         var opResult = -1
-        val matchPattern = Pattern.compile("OperationResult>(\\d+)<")
-        val m = matchPattern.matcher(raw)
-        if (m.find()) {
-            opResult = m.group(1)?.toIntOrNull() ?: -1
+        val parmPattern = Pattern.compile("name=[\"']OperationResult[\"']\\s+value=[\"'](\\d+)[\"']", Pattern.CASE_INSENSITIVE).matcher(raw)
+        if (parmPattern.find()) {
+            opResult = parmPattern.group(1)?.toIntOrNull() ?: -1
+        } else {
+            val tagPattern = Pattern.compile("<OperationResult>(\\d+)</OperationResult>", Pattern.CASE_INSENSITIVE).matcher(raw)
+            if (tagPattern.find()) {
+                opResult = tagPattern.group(1)?.toIntOrNull() ?: -1
+            }
         }
 
         val isMatch = opResult == 1

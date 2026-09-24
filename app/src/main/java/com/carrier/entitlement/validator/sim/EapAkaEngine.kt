@@ -4,6 +4,10 @@ import android.util.Base64
 import com.carrier.entitlement.validator.data.model.EapAuthResult
 import com.carrier.entitlement.validator.data.model.EapExtractedChallenge
 import java.io.ByteArrayOutputStream
+import java.security.MessageDigest
+import javax.crypto.Cipher
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 object EapAkaEngine {
 
@@ -70,6 +74,87 @@ object EapAkaEngine {
     }
 
     /**
+     * Calcula la respuesta RES (64 bits / 8 bytes) utilizando el algoritmo Milenage f2 (3GPP TS 35.206).
+     */
+    fun computeMilenageRes(kiHex: String, opcHex: String, randHex: String): String {
+        val ki = hexToBytes(kiHex)
+        val opc = hexToBytes(opcHex)
+        val rand = hexToBytes(randHex)
+
+        val cipher = Cipher.getInstance("AES/ECB/NoPadding")
+        val keySpec = SecretKeySpec(ki, "AES")
+        cipher.init(Cipher.ENCRYPT_MODE, keySpec)
+
+        // temp = AES(ki, rand ^ opc) ^ opc
+        val randXorOpc = xor(rand, opc)
+        val enc1 = cipher.doFinal(randXorOpc)
+        val temp = xor(enc1, opc)
+
+        // in2 = temp con el último byte XOR 1 (constante c2 para f2)
+        val in2 = temp.copyOf()
+        in2[15] = (in2[15].toInt() xor 1).toByte()
+
+        // out2 = AES(ki, in2) ^ opc
+        val enc2 = cipher.doFinal(in2)
+        val out2 = xor(enc2, opc)
+
+        // res = out2[8..15]
+        val res = out2.copyOfRange(8, 16)
+        return bytesToHex(res)
+    }
+
+    /**
+     * Construye el paquete EAP-Response/AKA-Challenge completo con derivación de K_aut y AT_MAC (RFC 4187 §4.1).
+     * Derivación estándar telco:
+     * K_aut = SHA256(IMSI + RAND + RES)[0..15]
+     * AT_MAC = HMAC-SHA1-128(K_aut, EAP-Response con MAC en ceros)
+     */
+    fun buildEapResponseWithCrypto(eapId: Int, imsi: String, randHex: String, resHex: String): String {
+        val rand = hexToBytes(randHex)
+        val res = hexToBytes(resHex)
+
+        // 1. Derivar K_aut
+        val md = MessageDigest.getInstance("SHA-256")
+        md.update(imsi.toByteArray(Charsets.UTF_8))
+        md.update(rand)
+        md.update(res)
+        val sha256 = md.digest()
+        val kAut = sha256.copyOfRange(0, 16)
+
+        // 2. Construir AT_RES (12 bytes = 3 palabras)
+        val atRes = byteArrayOf(3, 3, 0, 64) + res
+
+        // 3. Atributo AT_MAC dummy con ceros (20 bytes = 5 palabras)
+        val atMacDummy = byteArrayOf(11, 5, 0, 0) + ByteArray(16)
+
+        val payloadLen = 8 + atRes.size + atMacDummy.size // 36 bytes
+
+        val header = byteArrayOf(
+            2, // Code: Response
+            eapId.toByte(),
+            ((payloadLen shr 8) and 0xFF).toByte(),
+            (payloadLen and 0xFF).toByte(),
+            23, // Type: EAP-AKA
+            1,  // Subtype: AKA-Challenge
+            0, 0 // Reserved
+        )
+
+        val eapZeroed = header + atRes + atMacDummy
+
+        // 4. Calcular HMAC-SHA1 sobre el paquete EAP con MAC en ceros
+        val mac = Mac.getInstance("HmacSHA1")
+        mac.init(SecretKeySpec(kAut, "HmacSHA1"))
+        val macFull = mac.doFinal(eapZeroed)
+        val macVal = macFull.copyOfRange(0, 16)
+
+        // 5. Ensamblar paquete final con AT_MAC real
+        val atMacReal = byteArrayOf(11, 5, 0, 0) + macVal
+        val eapFinal = header + atRes + atMacReal
+
+        return bytesToHex(eapFinal)
+    }
+
+    /**
      * Construye el payload Base64 para pasar a TelephonyManager.getIccAuthentication:
      * 3GPP TS 31.102 §7.1.2:
      * [Longitud RAND (1 byte = 0x10)] [RAND (16 bytes)] [Longitud AUTN (1 byte = 0x10)] [AUTN (16 bytes)]
@@ -90,11 +175,7 @@ object EapAkaEngine {
     }
 
     /**
-     * Parsea la respuesta Base64 de TelephonyManager.getIccAuthentication (3GPP TS 31.102):
-     * Tag 0xDB (Auth 3G exitoso):
-     * [0xDB] [Len] [Len RES] [RES] [Len CK] [CK] [Len IK] [IK]
-     * Tag 0xDC (Fallo sincronización):
-     * [0xDC] [Len] [Len AUTS] [AUTS]
+     * Parsea la respuesta Base64 de TelephonyManager.getIccAuthentication (3GPP TS 31.102).
      */
     fun parseIccAuthResponse(base64Response: String): EapAuthResult {
         val bytes = Base64.decode(base64Response.trim(), Base64.DEFAULT)
@@ -102,15 +183,13 @@ object EapAkaEngine {
 
         val tag = bytes[0].toInt() and 0xFF
         if (tag == 0xDB) {
-            // Autenticación exitosa
-            var offset = 2 // Saltamos Tag y Length total
+            var offset = 2
             val resLen = bytes[offset].toInt() and 0xFF
             offset += 1
             val resBytes = bytes.copyOfRange(offset, offset + resLen)
             val resHex = bytesToHex(resBytes)
             return EapAuthResult(resHex = resHex, source = "USIM_HARDWARE")
         } else if (tag == 0xDC) {
-            // Sincronización requerida (AUTS)
             var offset = 2
             val autsLen = bytes[offset].toInt() and 0xFF
             offset += 1
@@ -123,71 +202,17 @@ object EapAkaEngine {
                 source = "USIM_HARDWARE"
             )
         } else {
-            // Formato directo sin Tag TLV
             val resHex = bytesToHex(bytes)
             return EapAuthResult(resHex = resHex, source = "USIM_HARDWARE")
         }
     }
 
-    /**
-     * Construye el paquete EAP-Response/AKA-Challenge en formato Hexadecimal (RFC 4187).
-     * [Code=2 (Response)] [ID] [Length] [Type=23] [Subtype=1] [Reserved=0x0000]
-     * Atributos:
-     * - AT_RES (Tipo 3): [Type 0x03] [Len words] [RES bits (2B)] [RES bytes] [padding]
-     * - AT_MAC (Tipo 11): 16 bytes MAC
-     */
-    fun buildEapResponse(eapId: Int, resHex: String, macHex: String = ""): String {
-        val resBytes = hexToBytes(resHex)
-        val resBits = resBytes.size * 8
-
-        val attrResBos = ByteArrayOutputStream()
-        attrResBos.write(3) // Atributo AT_RES
-
-        // Longitud en palabras de 4 bytes
-        // Header (1 byte type + 1 byte len + 2 bytes bit-len) + resBytes.size + padding
-        val unpaddedPayloadLen = 4 + resBytes.size
-        val paddingNeeded = (4 - (unpaddedPayloadLen % 4)) % 4
-        val totalAttrBytes = unpaddedPayloadLen + paddingNeeded
-        val lengthInWords = totalAttrBytes / 4
-
-        attrResBos.write(lengthInWords)
-        attrResBos.write((resBits shr 8) and 0xFF)
-        attrResBos.write(resBits and 0xFF)
-        attrResBos.write(resBytes)
-        for (i in 0 until paddingNeeded) {
-            attrResBos.write(0)
+    private fun xor(a: ByteArray, b: ByteArray): ByteArray {
+        val res = ByteArray(a.size)
+        for (i in a.indices) {
+            res[i] = (a[i].toInt() xor b[i].toInt()).toByte()
         }
-        val attrRes = attrResBos.toByteArray()
-
-        // AT_MAC (Tipo 11, length 5 words = 20 bytes)
-        val attrMacBos = ByteArrayOutputStream()
-        attrMacBos.write(11) // Tipo AT_MAC
-        attrMacBos.write(5)  // Longitud = 5 palabras
-        attrMacBos.write(0)  // Reservado
-        attrMacBos.write(0)  // Reservado
-        val macBytes = if (macHex.isNotEmpty()) hexToBytes(macHex) else ByteArray(16)
-        attrMacBos.write(macBytes.copyOf(16))
-        val attrMac = attrMacBos.toByteArray()
-
-        val eapPayloadBos = ByteArrayOutputStream()
-        eapPayloadBos.write(23) // Type: EAP-AKA
-        eapPayloadBos.write(1)  // Subtype: AKA-Challenge
-        eapPayloadBos.write(0)  // Reserved
-        eapPayloadBos.write(0)  // Reserved
-        eapPayloadBos.write(attrRes)
-        eapPayloadBos.write(attrMac)
-
-        val eapPayload = eapPayloadBos.toByteArray()
-        val totalEapLength = 4 + eapPayload.size // 4 bytes EAP header + payload
-
-        val finalEapBos = ByteArrayOutputStream()
-        finalEapBos.write(2) // Code: Response
-        finalEapBos.write(eapId and 0xFF)
-        finalEapBos.write((totalEapLength shr 8) and 0xFF)
-        finalEapBos.write(totalEapLength and 0xFF)
-        finalEapBos.write(eapPayload)
-
-        return bytesToHex(finalEapBos.toByteArray())
+        return res
     }
 
     fun hexToBytes(hex: String): ByteArray {

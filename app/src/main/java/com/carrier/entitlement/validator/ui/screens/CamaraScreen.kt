@@ -29,7 +29,7 @@ fun CamaraScreen(
     val coroutineScope = rememberCoroutineScope()
     val scrollState = rememberScrollState()
 
-    var phoneNumber by remember { mutableStateOf("+541179999999") }
+    var phoneNumber by remember { mutableStateOf("+541170000005") }
     var bearerToken by remember { mutableStateOf("dev-test-token") }
     var result by remember { mutableStateOf<CamaraVerifyResult?>(null) }
     var isExecuting by remember { mutableStateOf(false) }

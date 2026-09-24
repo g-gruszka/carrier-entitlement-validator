@@ -8,7 +8,6 @@ class EapAkaEngineTest {
 
     @Test
     fun testParseRealServerChallenge() {
-        // Paquete real capturado en vivo del Entitlement Server de laboratorio (Ronda 1)
         val serverEapPacket = "010100441701000001050000d2da577ecc76098e421683f532e0d9c702050000fe6b5885e2448000fd4e9ccfe46093880b05000082e54794e8127fb175b57f1dc98332b7"
 
         val challenge = EapAkaEngine.parseEapChallenge(serverEapPacket)
@@ -20,17 +19,26 @@ class EapAkaEngineTest {
     }
 
     @Test
-    fun testBuildEapResponse() {
-        val eapId = 1
-        val dummyRes = "0011223344556677" // 8 bytes (64 bits)
-        val macHex = "82e54794e8127fb175b57f1dc98332b7"
+    fun testUserSimMilenageCrypto() {
+        // Credenciales reales de la SIM provistas por el usuario
+        val ki = "51A609FE8A3B18CEE53A5EB2F3D6C051"
+        val opc = "A7695F045F0488396480353433A90007"
+        val rand = "061123778d00b58f215544d0e165c989"
+        val imsi = "722340390000126"
 
-        val responseHex = EapAkaEngine.buildEapResponse(eapId, dummyRes, macHex)
+        val res = EapAkaEngine.computeMilenageRes(ki, opc, rand)
+        assertEquals("73f47343eba0ecfa", res)
 
-        // Verificaciones básicas del paquete RFC 4187
-        assertTrue(responseHex.startsWith("0201")) // Code 2 (Response), ID 1
-        assertTrue(responseHex.contains("17010000")) // Type 23, Subtype 1
-        assertTrue(responseHex.contains("03030040")) // AT_RES, length 3 words (12B), 64 bits (0x0040)
-        assertTrue(responseHex.contains(dummyRes)) // Contiene el RES
+        val eapResponse = EapAkaEngine.buildEapResponseWithCrypto(
+            eapId = 1,
+            imsi = imsi,
+            randHex = rand,
+            resHex = res
+        )
+
+        assertTrue(eapResponse.startsWith("0201")) // Code 2 (Response), ID 1
+        assertTrue(eapResponse.contains("17010000")) // Type 23, Subtype 1
+        assertTrue(eapResponse.contains("03030040")) // AT_RES, len 3 words, 64 bits
+        assertTrue(eapResponse.contains(res)) // Contiene el RES
     }
 }

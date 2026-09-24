@@ -15,7 +15,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -41,12 +40,17 @@ fun Ts43Screen(
 
     val simInfo = remember { simManager.getSimInfo() }
 
-    // Parámetros de Identidad
-    var imsi by remember { mutableStateOf(simInfo.subscriberId ?: "722340000000001") }
-    var mcc by remember { mutableStateOf(simInfo.mcc ?: "722") }
-    var mnc by remember { mutableStateOf(simInfo.mnc ?: "034") }
-    var msisdnToVerify by remember { mutableStateOf(simInfo.phoneNumber ?: "541179999999") }
+    // Parámetros de la SIM del suscriptor (provisionada en HSS)
+    var imsi by remember { mutableStateOf(if (!simInfo.subscriberId.isNullOrBlank()) simInfo.subscriberId!! else "722340390000126") }
+    var mcc by remember { mutableStateOf(if (!simInfo.mcc.isNullOrBlank()) simInfo.mcc!! else "722") }
+    var mnc by remember { mutableStateOf(if (!simInfo.mnc.isNullOrBlank()) simInfo.mnc!! else "034") }
+    var ki by remember { mutableStateOf("51A609FE8A3B18CEE53A5EB2F3D6C051") }
+    var opc by remember { mutableStateOf("A7695F045F0488396480353433A90007") }
+    var msisdnToVerify by remember { mutableStateOf(if (!simInfo.phoneNumber.isNullOrBlank()) simInfo.phoneNumber!! else "541170000005") }
     var requestorId by remember { mutableStateOf("00000000-0000-4000-8000-0000000000b1") }
+
+    // Modo de cálculo de autenticación: true = Milenage con Ki/OPc de la SIM, false = USIM APDU física
+    var useMilenageCrypto by remember { mutableStateOf(true) }
 
     val rootNai = remember(imsi, mcc, mnc) {
         val cleanImsi = imsi.trim()
@@ -73,7 +77,7 @@ fun Ts43Screen(
             try {
                 val challenge = ts43Client.acquireTemporaryTokenRound1(rootNai)
                 round1Result = challenge
-                executionStatusText = "Ronda 1 Completada: Desafío EAP recibido."
+                executionStatusText = "Ronda 1 Completada: Desafío EAP recibido del HSS."
             } catch (e: Exception) {
                 executionErrorText = "Fallo en Ronda 1: ${e.message}"
             } finally {
@@ -86,34 +90,40 @@ fun Ts43Screen(
         val r1 = round1Result ?: return
         coroutineScope.launch {
             isExecuting = true
-            executionStatusText = "Extrayendo desafío y autenticando con la SIM..."
+            executionStatusText = "Calculando respuesta EAP-AKA..."
             executionErrorText = null
             try {
-                // 1. Extraer RAND y AUTN del paquete EAP
+                // 1. Extraer RAND del paquete EAP
                 val extracted = EapAkaEngine.parseEapChallenge(r1.eapRelayPacket)
 
-                // 2. Ejecutar autenticación contra la SIM física
-                val authRes = simManager.authenticateWithPhysicalUsim(extracted.randHex, extracted.autnHex)
-                if (authRes.isSyncFailure) {
-                    throw IllegalStateException("Fallo de sincronización USIM (AUTS: ${authRes.autsHex})")
+                // 2. Calcular RES (Milenage f2 o USIM física)
+                val resHex = if (useMilenageCrypto) {
+                    EapAkaEngine.computeMilenageRes(ki.trim(), opc.trim(), extracted.randHex)
+                } else {
+                    val authRes = simManager.authenticateWithPhysicalUsim(extracted.randHex, extracted.autnHex)
+                    if (authRes.isSyncFailure) {
+                        throw IllegalStateException("Fallo de sincronización USIM (AUTS: ${authRes.autsHex})")
+                    }
+                    authRes.resHex
                 }
-                lastResHex = authRes.resHex
+                lastResHex = resHex
 
-                // 3. Construir paquete EAP-Response
-                val eapResponseHex = EapAkaEngine.buildEapResponse(
+                // 3. Construir paquete EAP-Response completo con K_aut y AT_MAC
+                val eapResponseHex = EapAkaEngine.buildEapResponseWithCrypto(
                     eapId = extracted.eapId,
-                    resHex = authRes.resHex,
-                    macHex = extracted.macHex
+                    imsi = imsi.trim(),
+                    randHex = extracted.randHex,
+                    resHex = resHex
                 )
 
                 // 4. Enviar Ronda 2 al Entitlement Server
-                executionStatusText = "Enviando respuesta EAP al servidor..."
+                executionStatusText = "Enviando respuesta EAP al Entitlement Server..."
                 val r2 = ts43Client.acquireTemporaryTokenRound2(
                     eapResponsePacketHex = eapResponseHex,
                     eapSession = r1.eapSession
                 )
                 round2Result = r2
-                executionStatusText = "Ronda 2 Completada: TemporaryToken obtenido."
+                executionStatusText = "Ronda 2 Completada: TemporaryToken obtenido con éxito."
             } catch (e: Exception) {
                 executionErrorText = "Fallo en Ronda 2: ${e.message}"
             } finally {
@@ -131,11 +141,11 @@ fun Ts43Screen(
             try {
                 val res = ts43Client.verifyPhoneNumber(
                     temporaryToken = r2.token,
-                    msisdn = msisdnToVerify,
-                    requestorId = requestorId
+                    msisdn = msisdnToVerify.trim(),
+                    requestorId = requestorId.trim()
                 )
                 verifyResult = res
-                executionStatusText = if (res.isMatch) "¡Validación exitosa! Coincidencia confirmada." else "Número no coincide."
+                executionStatusText = if (res.isMatch) "¡Validación exitosa! Coincidencia confirmada (OperationResult=1)." else "Número no coincide."
             } catch (e: Exception) {
                 executionErrorText = "Fallo en VerifyPhoneNumber: ${e.message}"
             } finally {
@@ -148,39 +158,45 @@ fun Ts43Screen(
         coroutineScope.launch {
             isExecuting = true
             executionErrorText = null
-            executionStatusText = "[1/3] Iniciando Ronda 1..."
+            executionStatusText = "[1/3] Iniciando Ronda 1 (EAP-AKA Init)..."
             try {
                 // Paso 1
                 val r1 = ts43Client.acquireTemporaryTokenRound1(rootNai)
                 round1Result = r1
 
                 // Paso 2
-                executionStatusText = "[2/3] Autenticando con USIM física..."
+                executionStatusText = "[2/3] Calculando Milenage f2 y ensamblando EAP-Response..."
                 val extracted = EapAkaEngine.parseEapChallenge(r1.eapRelayPacket)
-                val authRes = simManager.authenticateWithPhysicalUsim(extracted.randHex, extracted.autnHex)
-                if (authRes.isSyncFailure) {
-                    throw IllegalStateException("Fallo de sincronización USIM (AUTS: ${authRes.autsHex})")
+                val resHex = if (useMilenageCrypto) {
+                    EapAkaEngine.computeMilenageRes(ki.trim(), opc.trim(), extracted.randHex)
+                } else {
+                    val authRes = simManager.authenticateWithPhysicalUsim(extracted.randHex, extracted.autnHex)
+                    if (authRes.isSyncFailure) {
+                        throw IllegalStateException("Fallo de sincronización USIM (AUTS: ${authRes.autsHex})")
+                    }
+                    authRes.resHex
                 }
-                lastResHex = authRes.resHex
+                lastResHex = resHex
 
-                val eapResponseHex = EapAkaEngine.buildEapResponse(
+                val eapResponseHex = EapAkaEngine.buildEapResponseWithCrypto(
                     eapId = extracted.eapId,
-                    resHex = authRes.resHex,
-                    macHex = extracted.macHex
+                    imsi = imsi.trim(),
+                    randHex = extracted.randHex,
+                    resHex = resHex
                 )
 
                 val r2 = ts43Client.acquireTemporaryTokenRound2(eapResponseHex, r1.eapSession)
                 round2Result = r2
 
                 // Paso 3
-                executionStatusText = "[3/3] Validando MSISDN contra ECS..."
+                executionStatusText = "[3/3] Validando MSISDN contra HSS (VerifyPhoneNumber)..."
                 val res = ts43Client.verifyPhoneNumber(
                     temporaryToken = r2.token,
-                    msisdn = msisdnToVerify,
-                    requestorId = requestorId
+                    msisdn = msisdnToVerify.trim(),
+                    requestorId = requestorId.trim()
                 )
                 verifyResult = res
-                executionStatusText = if (res.isMatch) "✅ Flujo E2E completado con ÉXITO." else "⚠️ Flujo finalizado: MSISDN no coincide."
+                executionStatusText = if (res.isMatch) "✅ Flujo E2E completado: IDENTIDAD CONFIRMADA EN HSS." else "⚠️ Flujo finalizado: MSISDN no coincide."
             } catch (e: Exception) {
                 executionErrorText = "Error en el flujo E2E: ${e.message}"
             } finally {
@@ -197,7 +213,7 @@ fun Ts43Screen(
             .verticalScroll(scrollState),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // Tarjeta de Identidad y NAI
+        // Tarjeta de Identidad y Claves de la SIM
         Card(
             colors = CardDefaults.cardColors(containerColor = DarkSurface),
             shape = RoundedCornerShape(12.dp)
@@ -208,18 +224,17 @@ fun Ts43Screen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Identidad de Abonado (USIM)", style = Typography.titleMedium, color = TextPrimary)
+                    Text("Identidad de Abonado (SIM / HSS)", style = Typography.titleMedium, color = TextPrimary)
                     TextButton(onClick = {
                         val fresh = simManager.getSimInfo()
                         if (fresh.subscriberId != null) imsi = fresh.subscriberId
                         if (fresh.mcc != null) mcc = fresh.mcc
                         if (fresh.mnc != null) mnc = fresh.mnc
-                        if (fresh.phoneNumber != null) msisdnToVerify = fresh.phoneNumber
-                        Toast.makeText(context, "Datos cargados desde la SIM física", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Operador leído: ${fresh.carrierName ?: "N/A"}", Toast.LENGTH_SHORT).show()
                     }) {
                         Icon(Icons.Default.SimCard, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Leer de SIM", fontSize = 12.sp)
+                        Text("Leer Operador", fontSize = 12.sp)
                     }
                 }
                 Spacer(modifier = Modifier.height(10.dp))
@@ -227,7 +242,7 @@ fun Ts43Screen(
                 OutlinedTextField(
                     value = imsi,
                     onValueChange = { imsi = it },
-                    label = { Text("IMSI") },
+                    label = { Text("IMSI del Chip") },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true
                 )
@@ -248,6 +263,22 @@ fun Ts43Screen(
                         singleLine = true
                     )
                 }
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = ki,
+                    onValueChange = { ki = it },
+                    label = { Text("Ki (Clave Secreta del Chip - Hex)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = opc,
+                    onValueChange = { opc = it },
+                    label = { Text("OPc (Operador - Hex)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
                 Spacer(modifier = Modifier.height(10.dp))
                 Text("NAI Raíz Calculado (3GPP TS 23.003):", style = Typography.bodySmall, color = TextSecondary)
                 Text(
@@ -324,20 +355,20 @@ fun Ts43Screen(
                 round1Result?.let { r1 ->
                     Spacer(modifier = Modifier.height(10.dp))
                     Text("Session ID: ${r1.sessionId}", style = Typography.labelSmall, color = SuccessGreen)
-                    Text("EAP Packet (Hex): ${r1.eapRelayPacket.take(32)}...", style = Typography.labelSmall, color = TextSecondary)
+                    Text("EAP Challenge (Hex): ${r1.eapRelayPacket.take(32)}...", style = Typography.labelSmall, color = TextSecondary)
                 }
             }
         }
 
-        // Paso 2: Ronda 2 (Challenge-Response con USIM)
+        // Paso 2: Ronda 2 (Challenge-Response)
         Card(
             colors = CardDefaults.cardColors(containerColor = DarkSurface),
             shape = RoundedCornerShape(12.dp)
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
-                Text("Paso 2: Ronda 2 (USIM Hardware + TemporaryToken)", style = Typography.titleMedium, color = TextPrimary)
+                Text("Paso 2: Ronda 2 (Milenage f2 + TemporaryToken)", style = Typography.titleMedium, color = TextPrimary)
                 Spacer(modifier = Modifier.height(6.dp))
-                Text("Pasa el reto a la SIM física (getIccAuthentication) y envía el RES.", style = Typography.bodySmall, color = TextSecondary)
+                Text("Calcula el RES con Milenage y deriva K_aut/AT_MAC para obtener el token.", style = Typography.bodySmall, color = TextSecondary)
                 Spacer(modifier = Modifier.height(10.dp))
                 Button(
                     onClick = { executeRound2() },
@@ -348,11 +379,11 @@ fun Ts43Screen(
                 }
                 lastResHex?.let { res ->
                     Spacer(modifier = Modifier.height(6.dp))
-                    Text("USIM RES (Hex): $res", style = Typography.labelSmall, color = AccentCyan)
+                    Text("RES Calculado (Hex): $res", style = Typography.labelSmall, color = AccentCyan)
                 }
                 round2Result?.let { r2 ->
                     Spacer(modifier = Modifier.height(8.dp))
-                    Text("Token Emitido: ${r2.token}", style = Typography.labelSmall, color = SuccessGreen)
+                    Text("TemporaryToken: ${r2.token}", style = Typography.labelSmall, color = SuccessGreen)
                 }
             }
         }
@@ -376,7 +407,7 @@ fun Ts43Screen(
                 OutlinedTextField(
                     value = requestorId,
                     onValueChange = { requestorId = it },
-                    label = { Text("Requestor ID") },
+                    label = { Text("Requestor ID (BFF)") },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true
                 )
@@ -403,7 +434,7 @@ fun Ts43Screen(
                                     fontWeight = FontWeight.Bold,
                                     color = fg
                                 )
-                                Text("El HSS confirmó la validación de identidad.", style = Typography.bodySmall, color = TextPrimary)
+                                Text("El HSS confirmó la identidad del suscriptor.", style = Typography.bodySmall, color = TextPrimary)
                             }
                         }
                     }
